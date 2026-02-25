@@ -1,0 +1,19 @@
+@startuml
+skinparam componentStyle rectangle
+
+participant "ConnectionStore" as CS
+participant "Connections view (TUI)" as CV
+
+CS -> CS : set_error(conn_id, ...)\nerror_count += 1
+CS -> CS : remove(conn_id, close_reason, flags)\nif problematic close => error_count >= 1
+
+CV -> CS : snapshot(active/all/closed)
+CV -> CV : render row\nErrs = error_count
+CV -> CV : Idle = now-last_activity (active)\nIdle = closed_ts-last_activity (closed)
+alt error_count > 0 OR problematic close OR last_error
+  CV -> CV : apply row_error color
+else normal
+  CV -> CV : apply bg color
+end
+
+@enduml

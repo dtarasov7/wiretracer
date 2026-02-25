@@ -1,0 +1,266 @@
+listeners:
+- name: test-http1
+  listen: 0.0.0.0:19100
+  tls:
+    cert: ./certs/server.crt
+    key: ./certs/server.key
+    require_client_cert: false
+    client_ca: null
+    alpn:
+    - http/1.1
+    min_version: TLS1.2
+  upstream:
+    addr: 127.0.0.1:18480
+    tls: false
+    server_name: null
+    verify: false
+    alpn:
+    - http/1.1
+    ca: null
+  policy:
+    max_connections: 200
+    maxconn_wait_warn_ms: 500
+    upstream_connect_timeout: 2.0
+    upstream_handshake_timeout: 3.0
+    allowlist:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 192.168.0.0/16
+  logging:
+    log_headers: true
+    log_body: true
+    body_max_bytes: 8192
+    redact_headers:
+    - authorization
+    - cookie
+    - x-api-key
+    sample_rate: 1.0
+    h2_control_events: true
+    jsonl_path: ./headless.jsonl
+
+- name: test-http2
+  listen: 0.0.0.0:19101
+  tls:
+    cert: ./certs/server.crt
+    key: ./certs/server.key
+    require_client_cert: false
+    client_ca: null
+    alpn:
+    - h2
+    min_version: TLS1.2
+  upstream:
+    addr: 127.0.0.1:18480
+    tls: false
+    server_name: null
+    verify: false
+    alpn:
+    - h2
+    ca: null
+  policy:
+    max_connections: 200
+    maxconn_wait_warn_ms: 500
+    upstream_connect_timeout: 2.0
+    upstream_handshake_timeout: 3.0
+    allowlist:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 192.168.0.0/16
+  logging:
+    log_headers: true
+    log_body: true
+    body_max_bytes: 8192
+    redact_headers:
+    - authorization
+    - cookie
+    - x-api-key
+    sample_rate: 1.0
+    h2_control_events: true
+    jsonl_path: null
+
+
+- name: test-mtls-http1
+  listen: 0.0.0.0:29100
+  tls:
+    cert: ./certs/server.crt
+    key: ./certs/server.key
+    require_client_cert: true
+    client_ca: ./certs/ca.crt
+    alpn:
+    - http/1.1
+    min_version: TLS1.2
+  upstream:
+    addr: 127.0.0.1:29443
+    tls: true
+    server_name: "localhost"
+    verify: false
+    alpn:
+    - http/1.1
+    ca: ./certs/ca.crt
+    client_cert: ./certs/client.crt
+    client_key: ./certs/client.key
+  policy:
+    max_connections: 200
+    maxconn_wait_warn_ms: 500
+    upstream_connect_timeout: 2.0
+    upstream_handshake_timeout: 3.0
+    allowlist:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 192.168.0.0/16
+  logging:
+    log_headers: true
+    log_body: true
+    body_max_bytes: 8192
+    redact_headers:
+    - authorization
+    - cookie
+    - x-api-key
+    sample_rate: 1.0
+    h2_control_events: true
+    jsonl_path: ./headless.jsonl
+
+- name: test-mtls-http2
+  listen: 0.0.0.0:29101
+  tls:
+    cert: ./certs/server.crt
+    key: ./certs/server.key
+    require_client_cert: true
+    client_ca: ./certs/ca.crt
+    alpn:
+    - h2
+    min_version: TLS1.2
+  upstream:
+    addr: 127.0.0.1:29443
+    tls: true
+    server_name: "localhost"
+    verify: false
+    alpn:
+    - h2
+    ca: ./certs/ca.crt
+    client_cert: ./certs/client.crt
+    client_key: ./certs/client.key
+  policy:
+    max_connections: 200
+    maxconn_wait_warn_ms: 500
+    upstream_connect_timeout: 2.0
+    upstream_handshake_timeout: 3.0
+    allowlist:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 192.168.0.0/16
+  logging:
+    log_headers: true
+    log_body: true
+    body_max_bytes: 8192
+    redact_headers:
+    - authorization
+    - cookie
+    - x-api-key
+    sample_rate: 1.0
+    h2_control_events: true
+    jsonl_path: null
+
+- name: test-mtls-h1-badup
+  listen: 0.0.0.0:29200
+  tls:
+    cert: ./certs/server.crt
+    key: ./certs/server.key
+    require_client_cert: true
+    client_ca: ./certs/ca.crt
+    alpn:
+    - http/1.1
+    min_version: TLS1.2
+  upstream:
+    addr: 127.0.0.1:29443
+    tls: true
+    server_name: "localhost"
+    verify: false
+    alpn:
+    - http/1.1
+    ca: ./certs/ca.crt
+    # ВАЖНО: ломаем client cert прокси на upstream
+    client_cert: ./certs/bad_client.crt
+    client_key: ./certs/bad_client.key
+  policy:
+    upstream_connect_timeout: 2.0
+    upstream_handshake_timeout: 3.0
+    allowlist:
+    - 127.0.0.0/8
+  logging:
+    log_headers: true
+    log_body: true
+    body_max_bytes: 8192
+    sample_rate: 1.0
+    h2_control_events: true
+    jsonl_path: null
+
+- name: test-mtls-h2-badup
+  listen: 0.0.0.0:29201
+  tls:
+    cert: ./certs/server.crt
+    key: ./certs/server.key
+    require_client_cert: true
+    client_ca: ./certs/ca.crt
+    alpn:
+    - h2
+    min_version: TLS1.2
+  upstream:
+    addr: 127.0.0.1:29443
+    tls: true
+    server_name: "localhost"
+    verify: false
+    alpn:
+    - h2
+    ca: ./certs/ca.crt
+    client_cert: ./certs/bad_client.crt
+    client_key: ./certs/bad_client.key
+  policy:
+    upstream_connect_timeout: 2.0
+    upstream_handshake_timeout: 3.0
+    allowlist:
+    - 127.0.0.0/8
+  logging:
+    log_headers: true
+    log_body: true
+    body_max_bytes: 8192
+    sample_rate: 1.0
+    h2_control_events: true
+    jsonl_path: null
+
+- name: grpc-exporter
+  listen: 0.0.0.0:9101
+  tls:
+    cert: ./certs/server.crt
+    key: ./certs/server.key
+    require_client_cert: false
+    client_ca: null
+    alpn:
+    - h2
+    - http/1.1
+    min_version: TLS1.2
+  upstream:
+    addr: 127.0.0.1:50052
+    tls: true
+    server_name: "localhost"   # SNI + проверка имени (рекомендуется)
+    verify: false 
+    alpn:
+    - h2
+    ca: ./certs/ca.crt
+  policy:
+    allowlist:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 192.168.0.0/16
+    max_connections: 200
+  logging:
+    log_headers: true
+    log_body: true
+    body_max_bytes: 8192
+    redact_headers:
+    - authorization
+    - cookie
+    - x-api-key
+    sample_rate: 1.0
+    h2_control_events: true
+    jsonl_path: null
+

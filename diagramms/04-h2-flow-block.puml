@@ -1,0 +1,19 @@
+@startuml
+participant "wiretracer" as P
+participant "H2Connection" as H2
+database Store
+
+note over P
+FLOW_BLOCK фиксируется, когда
+flow-control окно == 0 и
+прокси пытается отправить DATA.
+end note
+
+P -> H2 : local_flow_control_window(stream)
+alt window == 0
+  P -> Store : h2ctl(FLOW_BLOCK)\nwant_bytes = N
+else window > 0
+  P -> H2 : send_data(...)
+end
+
+@enduml

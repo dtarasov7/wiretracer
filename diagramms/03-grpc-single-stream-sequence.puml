@@ -1,0 +1,20 @@
+@startuml
+participant Client
+participant "wiretracer" as Proxy
+participant Upstream
+database Store
+
+Client -> Proxy : HEADERS (stream_id=1)\n:method POST\n:path /svc/method\ncontent-type: application/grpc
+Proxy -> Store : (optional) h2ctl events\n+ stream state init
+Proxy -> Upstream : HEADERS (stream_id=1)\n:authority rewritten
+Client -> Proxy : DATA (gRPC frames)
+Proxy -> Upstream : DATA (same bytes)
+Upstream -> Proxy : HEADERS\n:status 200\ngrpc-status: 0
+Proxy -> Client : HEADERS\n:status 200
+Upstream -> Proxy : DATA (gRPC response frames)
+Proxy -> Client : DATA
+Upstream -> Proxy : trailers (grpc-status)\nEND_STREAM
+Proxy -> Client : trailers\nEND_STREAM
+Proxy -> Store : event(proto=grpc)\n+ bodies captured (limited)\n+ duration/bytes
+
+@enduml

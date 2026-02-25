@@ -1,0 +1,25 @@
+@startuml
+actor Client
+participant "wiretracer" as Proxy
+participant Upstream
+database Store
+
+Client -> Proxy : TCP connect
+Proxy -> Proxy : start_tls(server_side)\n(ALPN negotiation)
+alt handshake ok
+  Proxy -> Store : tls(in, ok)\nSNI/ALPN/version/cipher
+  Client -> Proxy : HTTP/2 preface + SETTINGS
+  Proxy -> Store : h2ctl(SETTINGS downstream)
+  Proxy -> Upstream : connect (tls optional)
+  alt upstream handshake ok
+    Proxy -> Store : tls(out, ok)\nALPN chosen
+    Proxy -> Upstream : HTTP/2 preface + SETTINGS
+    Proxy -> Store : h2ctl(SETTINGS upstream)
+  else upstream handshake fail
+    Proxy -> Store : tls(out, fail, reason)
+  end
+else handshake fail
+  Proxy -> Store : tls(in, fail, reason)
+end
+
+@enduml

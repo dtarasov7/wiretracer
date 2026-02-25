@@ -1,0 +1,16 @@
+@startuml
+skinparam componentStyle rectangle
+
+component "Client" as C
+component "wiretracer\n(listener)" as P
+component "Upstream" as U
+database "RecordStore\n(event/tls/h2ctl/conn)" as S
+component "TUI (urwid)\nTraffic/Connections/Metrics\n+ row highlight\n+ Connections.Errs" as T
+
+C --> P : TLS + ALPN (h2 or http/1.1)
+P --> U : TLS/mTLS (optional) + ALPN
+P --> S : append records
+T --> S : snapshot/refresh
+T --> P : reload config
+
+@enduml

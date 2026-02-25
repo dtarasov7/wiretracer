@@ -1,0 +1,23 @@
+@startuml
+actor Client
+participant "wiretracer\n(listener)" as Proxy
+participant Upstream
+database Store
+
+Client -> Proxy : TCP connect
+Proxy -> Proxy : detect PROXY header\n(auto: none/v1/v2)
+
+alt PROXY v1/v2 detected
+  Proxy -> Store : conn(open)\nproxy_version/src/dst
+  Proxy -> Proxy : apply client endpoint from PROXY
+  Proxy -> Upstream : TCP connect
+  Proxy -> Upstream : send same PROXY header (raw)
+else no PROXY header
+  Proxy -> Store : conn(open)\nproxy_version=none
+  Proxy -> Upstream : TCP connect
+else malformed PROXY header
+  Proxy -> Store : conn(close)\nclose_reason=proxy_protocol_error
+  Proxy -> Client : close connection
+end
+
+@enduml
