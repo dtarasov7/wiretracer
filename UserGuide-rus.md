@@ -1,4 +1,4 @@
-﻿# wiretracer — Руководство пользователя
+# wiretracer — Руководство пользователя
 
 ## Оглавление
 - [1. Что это](#1-что-это)
@@ -38,6 +38,10 @@
   - при наличии входящего PROXY заголовка соединение к upstream выполняется с той же версией PROXY protocol.
 - Расширенная телеметрия соединения:
   - `proxy_version`, `proxy_src`, `proxy_dst` в `conn open/close`, Details и JSONL.
+- HTTP/2 fingerprint телеметрия:
+  - значения `h2fp` по направлениям и общий профиль в Connections/Details.
+- Inbound TLS fingerprint телеметрия (до TLS upgrade):
+  - `JA3`, `JA4`, наличие/длина `ECH`, наличие legacy `ESNI`.
 
 ## 3. Как работает прокси
 1. Принимает входящее TCP/TLS соединение на listener.
@@ -143,8 +147,8 @@ python3 wiretracer.py --config config.yaml --headless
 
 ## 7. Диагностика HTTP/2 и gRPC
 ### 7.1 Типы событий
-- `proto=tls` — входящие/исходящие handshake и причины fail;
-- `proto=h2ctl` — control frames и flow-control диагностика;
+- `proto=tls` — входящие/исходящие handshake и причины fail; для входа дополнительно ClientHello fingerprints (`JA3/JA4/ECH/ESNI`), если доступны;
+- `proto=h2ctl` — control frames, flow-control диагностика и `FINGERPRINT`-события H2-профиля;
 - `proto=grpc|http2|http1` — события запрос/ответ.
 
 ### 7.1.1 Визуальная индикация ошибок в TUI
@@ -177,6 +181,10 @@ python3 wiretracer.py --config config.yaml --headless
   - `proto=tls outcome=fail`
   - `proto=h2ctl`
   - `proto=grpc error=1`
+  - `ja3=<md5>`
+  - `ja4=t13d...`
+  - `ech=1`
+  - `h2fp=h2fp1:...`
 
 ## 10. Новые сценарии (актуально для текущей версии)
 - Единый listener может принимать mixed-трафик: клиенты с PROXY и без PROXY.
@@ -202,5 +210,4 @@ grpcurl -insecure -import-path ./test -proto helloworld.proto \
 - `README.md` — краткий англоязычный обзор для GitHub.
 - `README-rus.md` — краткий русскоязычный обзор для GitHub.
 - `test-suite/TEST_SUITE_GUIDE_RUS.md` — подробная инструкция по тестовому набору.
-
 

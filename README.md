@@ -1,4 +1,4 @@
-﻿# wiretracer
+# wiretracer
 
 TLS-terminating diagnostic L7 proxy for HTTP/1.1, HTTP/2, and gRPC.
 
@@ -18,6 +18,8 @@ TLS-terminating diagnostic L7 proxy for HTTP/1.1, HTTP/2, and gRPC.
 - Protocol visibility: `http1`, `http2`, `grpc`.
 - TLS/mTLS diagnostics on both sides (`client->proxy`, `proxy->upstream`).
 - HTTP/2 control-plane telemetry (`SETTINGS`, `RST_STREAM`, `GOAWAY`, flow-control) when `logging.h2_control_events: true`.
+- HTTP/2 fingerprinting (`h2fp`) from early control-plane behavior (`SETTINGS` + connection-level `WINDOW_UPDATE`).
+- Inbound TLS ClientHello fingerprinting: `JA3`, `JA4`, `ECH` detection, and legacy `ESNI` marker (best-effort).
 - TUI mode and headless JSONL mode.
 - TUI diagnostics improvements:
   - error/warn row highlighting in Traffic and Connections views;
@@ -69,6 +71,5 @@ For h2 keep-alive clients (for example `grpcurl`/grpc-go), a connection can stay
 
 ## License
 Use according to your repository license policy.
-
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -61,7 +62,7 @@ HEADER_MAX = 64 * 1024
 HARD_BODY_LIMIT = 10 * 1024 * 1024  # 10MB hard cap
 CURRENT_CONN_ID: ContextVar[Optional[str]] = ContextVar("CURRENT_CONN_ID", default=None)
 
-__version__ = "1.40.0"
+__version__ = "1.50.0"
 __AUTHOR__ = "Tarasov Dmitry"
 
 
@@ -191,6 +192,42 @@ def _extract_tid(path: str) -> Optional[str]:
         if part.startswith("tid="):
             return part[4:] or ""
     return None
+
+
+def _compute_h2_fingerprint(
+    changed: List[Dict[str, Any]],
+    conn_window_delta: Optional[int] = None,
+) -> Tuple[str, str]:
+    """
+    Build a stable HTTP/2 fingerprint from peer SETTINGS and first conn-level WINDOW_UPDATE.
+
+    Returns:
+      (fingerprint_id, profile_string)
+    """
+    pairs: List[Tuple[str, str]] = []
+    for item in (changed or []):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("setting", "") or "").strip().lower()
+        if not key:
+            continue
+        new_val = item.get("new", None)
+        if new_val is None:
+            sval = "null"
+        elif isinstance(new_val, bool):
+            sval = "1" if new_val else "0"
+        else:
+            sval = str(new_val)
+        pairs.append((key, sval))
+
+    pairs.sort(key=lambda kv: kv[0])
+    parts = [f"{k}={v}" for (k, v) in pairs]
+    if conn_window_delta is not None:
+        parts.append(f"conn_wu={int(conn_window_delta)}")
+
+    profile = ";".join(parts) if parts else "none"
+    digest = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:16]
+    return f"h2fp1:{digest}", profile
 
 
 # Config model
@@ -457,6 +494,311 @@ def _prepend_to_stream_reader(reader: asyncio.StreamReader, data: bytes) -> None
     buf = getattr(reader, "_buffer", None)
     if isinstance(buf, bytearray):
         buf[:0] = data
+
+
+def _is_grease_u16(v: int) -> bool:
+    """RFC 8701 GREASE values matcher for 16-bit code points."""
+    return (v & 0x0F0F) == 0x0A0A and ((v >> 8) & 0xFF) == (v & 0xFF)
+
+
+def _parse_client_hello_from_tls_record(record: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Parse a single TLS record that should contain ClientHello.
+
+    Returns parsed fields for JA3/JA4 or None if parsing is not possible.
+    """
+    if len(record) < 5:
+        return None
+    if record[0] != 0x16:  # handshake
+        return None
+    rec_len = int.from_bytes(record[3:5], "big")
+    if rec_len <= 0 or len(record) < 5 + rec_len:
+        return None
+
+    body = memoryview(record)[5:5 + rec_len]
+    if len(body) < 4:
+        return None
+    if body[0] != 0x01:  # ClientHello
+        return None
+    hs_len = int.from_bytes(bytes(body[1:4]), "big")
+    if hs_len <= 0 or len(body) < 4 + hs_len:
+        return None
+
+    ch = memoryview(body)[4:4 + hs_len]
+    p = 0
+    if len(ch) < 2 + 32 + 1:
+        return None
+
+    legacy_version = int.from_bytes(bytes(ch[p:p + 2]), "big")
+    p += 2
+    p += 32  # random
+
+    sid_len = int(ch[p])
+    p += 1
+    if p + sid_len > len(ch):
+        return None
+    p += sid_len
+
+    if p + 2 > len(ch):
+        return None
+    ciphers_len = int.from_bytes(bytes(ch[p:p + 2]), "big")
+    p += 2
+    if ciphers_len < 0 or p + ciphers_len > len(ch) or (ciphers_len % 2) != 0:
+        return None
+    ciphers_all: List[int] = []
+    for i in range(0, ciphers_len, 2):
+        ciphers_all.append(int.from_bytes(bytes(ch[p + i:p + i + 2]), "big"))
+    p += ciphers_len
+
+    if p + 1 > len(ch):
+        return None
+    comp_len = int(ch[p])
+    p += 1
+    if p + comp_len > len(ch):
+        return None
+    p += comp_len
+
+    exts_all: List[int] = []
+    groups_all: List[int] = []
+    ec_pf_all: List[int] = []
+    sigalgs_all: List[int] = []
+    supported_versions_all: List[int] = []
+    ext_lens: Dict[int, int] = {}
+    alpn_first: Optional[str] = None
+    sni_host: Optional[str] = None
+
+    if p < len(ch):
+        if p + 2 > len(ch):
+            return None
+        exts_len = int.from_bytes(bytes(ch[p:p + 2]), "big")
+        p += 2
+        if p + exts_len > len(ch):
+            return None
+        e_end = p + exts_len
+
+        while p + 4 <= e_end:
+            etype = int.from_bytes(bytes(ch[p:p + 2]), "big")
+            p += 2
+            elen = int.from_bytes(bytes(ch[p:p + 2]), "big")
+            p += 2
+            if p + elen > e_end:
+                return None
+            ed = memoryview(ch)[p:p + elen]
+            p += elen
+
+            exts_all.append(etype)
+            if etype not in ext_lens:
+                ext_lens[etype] = int(elen)
+
+            # supported_groups
+            if etype == 10 and len(ed) >= 2:
+                glen = int.from_bytes(bytes(ed[0:2]), "big")
+                if glen <= len(ed) - 2 and (glen % 2) == 0:
+                    for i in range(2, 2 + glen, 2):
+                        groups_all.append(int.from_bytes(bytes(ed[i:i + 2]), "big"))
+
+            # ec_point_formats
+            elif etype == 11 and len(ed) >= 1:
+                plen = int(ed[0])
+                if plen <= len(ed) - 1:
+                    for i in range(1, 1 + plen):
+                        ec_pf_all.append(int(ed[i]))
+
+            # signature_algorithms
+            elif etype == 13 and len(ed) >= 2:
+                slen = int.from_bytes(bytes(ed[0:2]), "big")
+                if slen <= len(ed) - 2 and (slen % 2) == 0:
+                    for i in range(2, 2 + slen, 2):
+                        sigalgs_all.append(int.from_bytes(bytes(ed[i:i + 2]), "big"))
+
+            # supported_versions
+            elif etype == 43 and len(ed) >= 1:
+                vlen = int(ed[0])
+                if vlen <= len(ed) - 1 and (vlen % 2) == 0:
+                    for i in range(1, 1 + vlen, 2):
+                        supported_versions_all.append(int.from_bytes(bytes(ed[i:i + 2]), "big"))
+
+            # server_name
+            elif etype == 0 and len(ed) >= 2:
+                nlen = int.from_bytes(bytes(ed[0:2]), "big")
+                q = 2
+                end_n = min(len(ed), 2 + nlen)
+                while q + 3 <= end_n:
+                    name_type = int(ed[q])
+                    q += 1
+                    hlen = int.from_bytes(bytes(ed[q:q + 2]), "big")
+                    q += 2
+                    if q + hlen > end_n:
+                        break
+                    raw_name = bytes(ed[q:q + hlen])
+                    q += hlen
+                    if name_type == 0:
+                        try:
+                            sni_host = raw_name.decode("utf-8", "ignore").strip().lower() or None
+                        except Exception:
+                            sni_host = None
+                        break
+
+            # ALPN
+            elif etype == 16 and len(ed) >= 2:
+                llen = int.from_bytes(bytes(ed[0:2]), "big")
+                if llen <= len(ed) - 2:
+                    q = 2
+                    end_l = 2 + llen
+                    if q < end_l:
+                        n = int(ed[q])
+                        q += 1
+                        if q + n <= end_l:
+                            try:
+                                alpn_first = bytes(ed[q:q + n]).decode("ascii", "ignore").lower() or None
+                            except Exception:
+                                alpn_first = None
+
+    return {
+        "legacy_version": legacy_version,
+        "ciphers_all": ciphers_all,
+        "exts_all": exts_all,
+        "groups_all": groups_all,
+        "ec_pf_all": ec_pf_all,
+        "sigalgs_all": sigalgs_all,
+        "supported_versions_all": supported_versions_all,
+        "ext_lens": ext_lens,
+        "alpn_first": alpn_first,
+        "sni_host": sni_host,
+    }
+
+
+def _compute_ja3_ja4(ch: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Build JA3 and JA4 strings + hashes from parsed ClientHello fields."""
+    legacy_version = int(ch.get("legacy_version", 0) or 0)
+    ciphers_all = list(ch.get("ciphers_all", []) or [])
+    exts_all = list(ch.get("exts_all", []) or [])
+    groups_all = list(ch.get("groups_all", []) or [])
+    ec_pf_all = list(ch.get("ec_pf_all", []) or [])
+    sigalgs_all = list(ch.get("sigalgs_all", []) or [])
+    supported_versions_all = list(ch.get("supported_versions_all", []) or [])
+    alpn_first = ch.get("alpn_first")
+    sni_host = ch.get("sni_host")
+
+    ciphers = [x for x in ciphers_all if not _is_grease_u16(int(x))]
+    exts = [x for x in exts_all if not _is_grease_u16(int(x))]
+    groups = [x for x in groups_all if not _is_grease_u16(int(x))]
+
+    ja3_raw = ",".join([
+        str(legacy_version),
+        "-".join(str(int(x)) for x in ciphers),
+        "-".join(str(int(x)) for x in exts),
+        "-".join(str(int(x)) for x in groups),
+        "-".join(str(int(x)) for x in ec_pf_all),
+    ])
+    ja3 = hashlib.md5(ja3_raw.encode("utf-8")).hexdigest()
+
+    # JA4-style compact token (inbound TLS over TCP)
+    tlsver_map = {
+        0x0301: "10",
+        0x0302: "11",
+        0x0303: "12",
+        0x0304: "13",
+    }
+    ver = "00"
+    if supported_versions_all:
+        vv = [int(v) for v in supported_versions_all if not _is_grease_u16(int(v))]
+        if vv:
+            ver = tlsver_map.get(max(vv), f"{max(vv) & 0xFF:02d}")
+    elif legacy_version:
+        ver = tlsver_map.get(legacy_version, f"{legacy_version & 0xFF:02d}")
+
+    sni_flag = "d" if (sni_host and re.search(r"[a-z]", sni_host)) else "i"
+
+    cc = min(99, len(ciphers))
+    ec = min(99, len(exts))
+
+    alpn_tok = "00"
+    if isinstance(alpn_first, str) and alpn_first:
+        a = alpn_first.lower()
+        if a == "h2":
+            alpn_tok = "h2"
+        elif a in ("http/1.1", "http/1.0"):
+            alpn_tok = "h1"
+        else:
+            alpn_tok = re.sub(r"[^a-z0-9]", "", a)[:2].ljust(2, "0")
+
+    c_src = "-".join(f"{int(x):04x}" for x in ciphers) or "none"
+    e_src = (
+        ("-".join(f"{int(x):04x}" for x in exts) or "none")
+        + "|"
+        + ("-".join(f"{int(x):04x}" for x in groups) or "none")
+        + "|"
+        + ("-".join(f"{int(x):04x}" for x in sigalgs_all if not _is_grease_u16(int(x))) or "none")
+    )
+    c_hash = hashlib.sha256(c_src.encode("utf-8")).hexdigest()[:12]
+    e_hash = hashlib.sha256(e_src.encode("utf-8")).hexdigest()[:12]
+
+    ja4_raw = f"t{ver}{sni_flag}{cc:02d}{ec:02d}{alpn_tok}_{c_hash}_{e_hash}"
+    ja4 = ja4_raw
+    return ja3, ja3_raw, ja4, ja4_raw
+
+
+async def detect_inbound_tls_fingerprints(sock_obj: Any, *, timeout_s: float = 1.0) -> Dict[str, str]:
+    """
+    Best-effort JA3/JA4 extraction from inbound ClientHello without consuming socket bytes.
+    """
+    raw_sock = _unwrap_raw_socket(sock_obj)
+    if raw_sock is None:
+        return {}
+
+    deadline = time.time() + max(0.05, float(timeout_s))
+    try:
+        while True:
+            head = await _sock_peek(raw_sock, 5, deadline)
+            if len(head) < 5:
+                await asyncio.sleep(0.005)
+                continue
+            if head[0] != 0x16:
+                return {}
+            rec_len = int.from_bytes(head[3:5], "big")
+            total = 5 + rec_len
+            if total <= 5 or total > 64 * 1024:
+                return {}
+
+            data = await _sock_peek(raw_sock, total, deadline)
+            if len(data) < total:
+                await asyncio.sleep(0.005)
+                continue
+
+            ch = _parse_client_hello_from_tls_record(data[:total])
+            if not ch:
+                return {}
+            ja3, ja3_raw, ja4, ja4_raw = _compute_ja3_ja4(ch)
+            out = {
+                "ja3": ja3,
+                "ja3_raw": ja3_raw,
+                "ja4": ja4,
+                "ja4_raw": ja4_raw,
+            }
+            exts_all = list(ch.get("exts_all", []) or [])
+            ext_lens = dict(ch.get("ext_lens", {}) or {})
+            ech_present = any(int(x) == 0xFE0D for x in exts_all)
+            esni_present = any(int(x) == 0xFFCE for x in exts_all)
+            out["ech_present"] = "1" if ech_present else "0"
+            out["esni_legacy_present"] = "1" if esni_present else "0"
+            if ech_present:
+                try:
+                    out["ech_len"] = str(int(ext_lens.get(0xFE0D, 0)))
+                except Exception:
+                    out["ech_len"] = "0"
+            sni = ch.get("sni_host")
+            if isinstance(sni, str) and sni:
+                out["sni_ch"] = sni
+            alpn = ch.get("alpn_first")
+            if isinstance(alpn, str) and alpn:
+                out["alpn_ch"] = alpn
+            return out
+    except asyncio.TimeoutError:
+        return {}
+    except Exception:
+        LOG.debug("detect_inbound_tls_fingerprints failed", exc_info=True)
+        return {}
 
 
 async def _detect_proxy_protocol_header_stream_reader(
@@ -868,6 +1210,7 @@ class TlsHandshakeRecord:
 
     tls: "TlsInfo" = field(default_factory=lambda: TlsInfo())
     upstream: Dict[str, Any] = field(default_factory=dict)
+    fingerprints: Dict[str, str] = field(default_factory=dict)
 
     # link to connection (auto-attached by store via contextvar in your code)
     conn_id: Optional[str] = None
@@ -1027,10 +1370,18 @@ class ConnInfo:
     alpn_in: Optional[str] = None
     alpn_out: Optional[str] = None
     sni_out: Optional[str] = None
+    ja3_in: Optional[str] = None
+    ja4_in: Optional[str] = None
+    ech_in: Optional[bool] = None
+    ech_len_in: Optional[int] = None
+    esni_legacy_in: Optional[bool] = None
 
     # HTTP/2 stream counters
     h2_open_streams: int = 0
     h2_total_streams: int = 0
+    h2_fp: Optional[str] = None
+    h2_fp_in: Optional[str] = None
+    h2_fp_out: Optional[str] = None
 
     # misc
     last_error: Optional[str] = None
@@ -1161,6 +1512,30 @@ class ConnectionStore:
         except Exception:
             LOG.debug("ConnectionStore.set_tls_in failed conn_id=%s", conn_id, exc_info=True)
 
+    async def set_inbound_tls_fingerprints(
+            self,
+            conn_id: str,
+            *,
+            ja3: Optional[str],
+            ja4: Optional[str],
+            ech_present: Optional[bool] = None,
+            ech_len: Optional[int] = None,
+            esni_legacy_present: Optional[bool] = None,
+    ) -> None:
+        """Persist inbound JA3/JA4 fingerprints parsed from ClientHello."""
+        try:
+            async with self._lock:
+                ci = self._active.get(conn_id)
+                if ci:
+                    ci.ja3_in = (ja3 or None)
+                    ci.ja4_in = (ja4 or None)
+                    ci.ech_in = ech_present
+                    ci.ech_len_in = ech_len
+                    ci.esni_legacy_in = esni_legacy_present
+                    ci.last_activity_ts = time.time()
+        except Exception:
+            LOG.debug("ConnectionStore.set_inbound_tls_fingerprints failed conn_id=%s", conn_id, exc_info=True)
+
     async def set_client_endpoint(self, conn_id: str, client_ip: str, client_port: int) -> None:
         """Update client endpoint (e.g. from PROXY protocol header)."""
         try:
@@ -1246,6 +1621,34 @@ class ConnectionStore:
                     ci.last_activity_ts = time.time()
         except Exception:
             LOG.debug("ConnectionStore.h2_stream_close failed conn_id=%s", conn_id, exc_info=True)
+
+    async def set_h2_fingerprint(self, conn_id: str, *, direction: str, fp: str) -> None:
+        """Persist per-side and combined HTTP/2 fingerprint for a connection."""
+        try:
+            async with self._lock:
+                ci = self._active.get(conn_id)
+                if not ci:
+                    return
+                d = (direction or "").lower().strip()
+                if d == "downstream":
+                    ci.h2_fp_in = fp
+                elif d == "upstream":
+                    ci.h2_fp_out = fp
+                else:
+                    return
+
+                if ci.h2_fp_in and ci.h2_fp_out:
+                    ci.h2_fp = f"{ci.h2_fp_in}|{ci.h2_fp_out}"
+                else:
+                    ci.h2_fp = ci.h2_fp_in or ci.h2_fp_out
+                ci.last_activity_ts = time.time()
+        except Exception:
+            LOG.debug(
+                "ConnectionStore.set_h2_fingerprint failed conn_id=%s direction=%s",
+                conn_id,
+                direction,
+                exc_info=True,
+            )
 
     async def snapshot(self, *, include_closed: bool = False) -> List[ConnInfo]:
         """Return a snapshot for UI: active only or active+closed history."""
@@ -1885,6 +2288,7 @@ class ListenerRuntime:
         proxy_version = "none"
         proxy_src: Optional[str] = None
         proxy_dst: Optional[str] = None
+        inbound_fp: Dict[str, str] = {}
 
         try:
             # Auto-detect incoming PROXY protocol (v1/v2/none) before TLS-in.
@@ -1905,6 +2309,12 @@ class ListenerRuntime:
                         )
                 try:
                     proxy_header = await detect_proxy_protocol_header(sock_obj, timeout_s=1.0)
+
+                    # Best-effort ClientHello fingerprinting (JA3/JA4) before TLS handshake.
+                    try:
+                        inbound_fp = await detect_inbound_tls_fingerprints(sock_obj, timeout_s=1.0)
+                    except Exception:
+                        inbound_fp = {}
                 finally:
                     if transport is not None:
                         try:
@@ -1953,6 +2363,25 @@ class ListenerRuntime:
             except Exception:
                 LOG.debug("conn_store.set_proxy_info failed listener=%s conn_id=%s", self.cfg.name, conn_id,
                           exc_info=True)
+            try:
+                ech_present = inbound_fp.get("ech_present")
+                esni_present = inbound_fp.get("esni_legacy_present")
+                ech_len_raw = inbound_fp.get("ech_len")
+                try:
+                    ech_len_val = int(ech_len_raw) if ech_len_raw is not None else None
+                except Exception:
+                    ech_len_val = None
+                await self.conn_store.set_inbound_tls_fingerprints(
+                    conn_id,
+                    ja3=inbound_fp.get("ja3"),
+                    ja4=inbound_fp.get("ja4"),
+                    ech_present=(ech_present == "1"),
+                    ech_len=ech_len_val,
+                    esni_legacy_present=(esni_present == "1"),
+                )
+            except Exception:
+                LOG.debug("conn_store.set_inbound_tls_fingerprints failed listener=%s conn_id=%s",
+                          self.cfg.name, conn_id, exc_info=True)
 
             # Traffic timeline: conn open (already with final client endpoint and proxy metadata)
             try:
@@ -2036,6 +2465,7 @@ class ListenerRuntime:
                                 detail=None,  
                                 tls=tls_in,
                                 upstream={"addr": self.cfg.upstream.addr},
+                                fingerprints=dict(inbound_fp),
                             )
                         )
                     except Exception:
@@ -2068,6 +2498,7 @@ class ListenerRuntime:
                                 detail=detail,  
                                 tls=TlsInfo(),
                                 upstream={"addr": self.cfg.upstream.addr},
+                                fingerprints=dict(inbound_fp),
                             )
                         )
                     except Exception:
@@ -2532,6 +2963,21 @@ def _get_record_field(rec: Any, field: str) -> str:
         return str(getattr(rec, "side") or "")
     if f == "reason" and hasattr(rec, "reason"):
         return str(getattr(rec, "reason") or "")
+    if f == "ja3":
+        fp = getattr(rec, "fingerprints", None) or {}
+        return str(fp.get("ja3", "") or "")
+    if f == "ja4":
+        fp = getattr(rec, "fingerprints", None) or {}
+        return str(fp.get("ja4", "") or "")
+    if f == "ech":
+        fp = getattr(rec, "fingerprints", None) or {}
+        return str(fp.get("ech_present", "") or "")
+    if f in ("ech_len", "echlen"):
+        fp = getattr(rec, "fingerprints", None) or {}
+        return str(fp.get("ech_len", "") or "")
+    if f in ("esni", "esni_legacy"):
+        fp = getattr(rec, "fingerprints", None) or {}
+        return str(fp.get("esni_legacy_present", "") or "")
 
     # h2 control fields
     if f in ("h2", "h2_event"):
@@ -2576,6 +3022,25 @@ def _get_conn_field(ci: Any, field: str) -> str:
         return str(getattr(ci, "alpn_in", "") or "")
     if f == "alpn_out":
         return str(getattr(ci, "alpn_out", "") or "")
+    if f in ("ja3", "ja3_in"):
+        return str(getattr(ci, "ja3_in", "") or "")
+    if f in ("ja4", "ja4_in"):
+        return str(getattr(ci, "ja4_in", "") or "")
+    if f in ("ech", "ech_in"):
+        v = getattr(ci, "ech_in", None)
+        return "1" if v is True else "0" if v is False else ""
+    if f in ("ech_len", "echlen", "ech_len_in"):
+        v = getattr(ci, "ech_len_in", None)
+        return "" if v is None else str(int(v))
+    if f in ("esni", "esni_legacy", "esni_in"):
+        v = getattr(ci, "esni_legacy_in", None)
+        return "1" if v is True else "0" if v is False else ""
+    if f in ("h2fp", "h2_fp", "h2fingerprint", "h2_fingerprint"):
+        return str(getattr(ci, "h2_fp", "") or "")
+    if f in ("h2fp_in", "h2_fp_in"):
+        return str(getattr(ci, "h2_fp_in", "") or "")
+    if f in ("h2fp_out", "h2_fp_out"):
+        return str(getattr(ci, "h2_fp_out", "") or "")
     if f == "error":
         return "1" if getattr(ci, "last_error", None) else "0"
     return ""
@@ -2656,6 +3121,10 @@ class FilterSpec:
                 _get_record_field(rec, "status"),
                 _get_record_field(rec, "reason"),
                 _get_record_field(rec, "h2_event"),
+                _get_record_field(rec, "ja3"),
+                _get_record_field(rec, "ja4"),
+                _get_record_field(rec, "ech"),
+                _get_record_field(rec, "esni"),
             ]).lower()
             return needle in hay
 
@@ -2673,6 +3142,11 @@ class FilterSpec:
                 _get_conn_field(ci, "upstream"),
                 _get_conn_field(ci, "alpn_in"),
                 _get_conn_field(ci, "alpn_out"),
+                _get_conn_field(ci, "ja3"),
+                _get_conn_field(ci, "ja4"),
+                _get_conn_field(ci, "ech"),
+                _get_conn_field(ci, "esni"),
+                _get_conn_field(ci, "h2_fp"),
             ]).lower()
             return needle in hay
 
@@ -3934,6 +4408,10 @@ class ProxyConnection:
         want_end_down: Dict[int, bool] = {}
 
         st_fc_blocked: Dict[int, float] = {}
+        h2_fp_seen_down = False
+        h2_fp_seen_up = False
+        h2_conn_wu_down: Optional[int] = None
+        h2_conn_wu_up: Optional[int] = None
 
         def maybe_capture(buf: bytearray, trunc_map: Dict[int, bool], sid: int, data: bytes):
             if capture_max < 0:
@@ -4167,6 +4645,7 @@ class ProxyConnection:
             """
             DOWNSTREAM (client -> proxy)
             """
+            nonlocal h2_fp_seen_down, h2_conn_wu_down
             try:
                 while not stop_evt.is_set():
                     data = await self.c_reader.read(65536)
@@ -4283,6 +4762,11 @@ class ProxyConnection:
                             await self.runtime.conn_store.h2_stream_close(self.conn_id)
 
                         elif isinstance(ev, WindowUpdated):
+                            if ev.stream_id == 0 and h2_conn_wu_down is None:
+                                try:
+                                    h2_conn_wu_down = int(getattr(ev, "delta", 0))
+                                except Exception:
+                                    h2_conn_wu_down = None
                             await emit_h2ctl_if_enabled(
                                 direction="downstream",
                                 evname="WINDOW_UPDATE",
@@ -4318,6 +4802,20 @@ class ProxyConnection:
                                         "new": getattr(chg, "new_value", None),
                                     }
                                 )
+                            if not h2_fp_seen_down:
+                                fp, profile = _compute_h2_fingerprint(changed, h2_conn_wu_down)
+                                await self.runtime.conn_store.set_h2_fingerprint(
+                                    self.conn_id,
+                                    direction="downstream",
+                                    fp=fp,
+                                )
+                                await emit_h2ctl_if_enabled(
+                                    direction="downstream",
+                                    evname="FINGERPRINT",
+                                    stream_id=None,
+                                    details={"h2fp": fp, "profile": profile},
+                                )
+                                h2_fp_seen_down = True
                             await emit_h2ctl_if_enabled(
                                 direction="downstream",
                                 evname="SETTINGS",
@@ -4358,6 +4856,7 @@ class ProxyConnection:
             """
             UPSTREAM (server -> proxy)
             """
+            nonlocal h2_fp_seen_up, h2_conn_wu_up
             try:
                 while not stop_evt.is_set():
                     data = await u_reader.read(65536)
@@ -4458,6 +4957,11 @@ class ProxyConnection:
                             await self.runtime.conn_store.h2_stream_close(self.conn_id)
 
                         elif isinstance(ev, WindowUpdated):
+                            if ev.stream_id == 0 and h2_conn_wu_up is None:
+                                try:
+                                    h2_conn_wu_up = int(getattr(ev, "delta", 0))
+                                except Exception:
+                                    h2_conn_wu_up = None
                             await emit_h2ctl_if_enabled(
                                 direction="upstream",
                                 evname="WINDOW_UPDATE",
@@ -4493,6 +4997,20 @@ class ProxyConnection:
                                         "new": getattr(chg, "new_value", None),
                                     }
                                 )
+                            if not h2_fp_seen_up:
+                                fp, profile = _compute_h2_fingerprint(changed, h2_conn_wu_up)
+                                await self.runtime.conn_store.set_h2_fingerprint(
+                                    self.conn_id,
+                                    direction="upstream",
+                                    fp=fp,
+                                )
+                                await emit_h2ctl_if_enabled(
+                                    direction="upstream",
+                                    evname="FINGERPRINT",
+                                    stream_id=None,
+                                    details={"h2fp": fp, "profile": profile},
+                                )
+                                h2_fp_seen_up = True
                             await emit_h2ctl_if_enabled(
                                 direction="upstream",
                                 evname="SETTINGS",
@@ -4842,6 +5360,19 @@ class TrafficList(urwid.WidgetWrap):
                     details.append(f"sni={rec.tls.sni}")
                 if rec.tls and rec.tls.cipher:
                     details.append(rec.tls.cipher)
+                fp = getattr(rec, "fingerprints", None) or {}
+                if rec.side == "in":
+                    if fp.get("ja3"):
+                        details.append(f"ja3={fp.get('ja3')}")
+                    if fp.get("ja4"):
+                        details.append(f"ja4={fp.get('ja4')}")
+                    if fp.get("ech_present") in ("0", "1"):
+                        ech_txt = f"ech={fp.get('ech_present')}"
+                        if fp.get("ech_len") is not None:
+                            ech_txt += f":{fp.get('ech_len')}"
+                        details.append(ech_txt)
+                    if fp.get("esni_legacy_present") in ("0", "1"):
+                        details.append(f"esni={fp.get('esni_legacy_present')}")
 
                 base = f"{rec.side} {rec.reason or ''}".strip()
 
@@ -4925,6 +5456,7 @@ class TrafficList(urwid.WidgetWrap):
                 code_map = {
                     "SETTINGS": "SET",
                     "SETTINGS_ACK": "SET_ACK",
+                    "FINGERPRINT": "H2FP",
                     "WINDOW_UPDATE": "WUPD",
                     "FLOW_BLOCK": "FLOW_BLK",
                     "RST_STREAM": "RST",
@@ -4960,6 +5492,10 @@ class TrafficList(urwid.WidgetWrap):
                         bits.append(f"err={err}")
                     if last is not None:
                         bits.append(f"last={last}")
+                elif ev == "FINGERPRINT":
+                    fp = d.get("h2fp")
+                    if fp:
+                        bits.append(str(fp))
 
                 what = " ".join(bits)
                 dur = "-"
@@ -5161,6 +5697,17 @@ class ConnectionsList(urwid.WidgetWrap):
                 meta.append(f"{ci.closed_by or '?'}:{ci.close_reason or '?'}")
             if getattr(ci, "close_flags", None):
                 meta.append(",".join(ci.close_flags[:3]))
+            if ci.ja4_in:
+                meta.append(f"ja4={ci.ja4_in}")
+            if ci.ech_in is True:
+                if ci.ech_len_in is not None:
+                    meta.append(f"ech=1:{ci.ech_len_in}")
+                else:
+                    meta.append("ech=1")
+            if ci.esni_legacy_in is True:
+                meta.append("esni=1")
+            if ci.h2_fp:
+                meta.append(f"h2fp={ci.h2_fp}")
             if ci.last_error:
                 meta.append(ci.last_error)
 
@@ -5585,6 +6132,11 @@ class TuiApp:
             "  path=/health\n"
             "  path~^/helloworld\\.Greeter/\n"
             "  conn=<uuid>          (drilldown by connection)\n"
+            "  ja3=<md5>            (tls in / Connections)\n"
+            "  ja4=t13d...          (tls in / Connections)\n"
+            "  ech=1                (tls in / Connections)\n"
+            "  esni=1               (tls in / Connections)\n"
+            "  h2fp=h2fp1:...       (Connections view)\n"
             "  error=1\n\n"
             "Notes:\n"
             "  - h2ctl rows are optional (only if proxy emits HTTP/2 control events).\n"
@@ -5858,6 +6410,30 @@ class TuiApp:
                     if "mtls" in rec.upstream:
                         lines.append(f"mTLS:        {rec.upstream.get('mtls')}")
 
+            fp = getattr(rec, "fingerprints", None) or {}
+            if fp:
+                lines.append("")
+                lines.append("ClientHello fingerprint:")
+                if fp.get("ja3"):
+                    lines.append(f"  JA3:      {fp.get('ja3')}")
+                if fp.get("ja4"):
+                    lines.append(f"  JA4:      {fp.get('ja4')}")
+                if fp.get("ech_present") in ("0", "1"):
+                    ech_line = f"  ECH:      {fp.get('ech_present')}"
+                    if fp.get("ech_len") is not None:
+                        ech_line += f" (len={fp.get('ech_len')})"
+                    lines.append(ech_line)
+                if fp.get("esni_legacy_present") in ("0", "1"):
+                    lines.append(f"  ESNI(old): {fp.get('esni_legacy_present')}")
+                if fp.get("sni_ch"):
+                    lines.append(f"  SNI(CH):  {fp.get('sni_ch')}")
+                if fp.get("alpn_ch"):
+                    lines.append(f"  ALPN(CH): {fp.get('alpn_ch')}")
+                if fp.get("ja3_raw"):
+                    lines.append(f"  JA3 raw:  {fp.get('ja3_raw')}")
+                if fp.get("ja4_raw"):
+                    lines.append(f"  JA4 raw:  {fp.get('ja4_raw')}")
+
             return title, lines
 
         # ---- Connection lifecycle ----
@@ -5999,6 +6575,11 @@ class TuiApp:
         lines.append(f"  Version: {ci.tls_in.version}")
         lines.append(f"  Cipher: {ci.tls_in.cipher}")
         lines.append(f"  SNI(in): {ci.tls_in.sni}")
+        lines.append(f"  JA3(in): {ci.ja3_in or '-'}")
+        lines.append(f"  JA4(in): {ci.ja4_in or '-'}")
+        lines.append(f"  ECH(in): {'1' if ci.ech_in else '0' if ci.ech_in is False else '-'}")
+        lines.append(f"  ECH len(in): {ci.ech_len_in if ci.ech_len_in is not None else '-'}")
+        lines.append(f"  ESNI(old,in): {'1' if ci.esni_legacy_in else '0' if ci.esni_legacy_in is False else '-'}")
         lines.append("")
         lines.append("TLS OUT (proxy -> upstream):")
         lines.append(f"  SNI(out): {ci.sni_out}")
@@ -6008,6 +6589,9 @@ class TuiApp:
         lines.append("")
         if (ci.alpn_in or "").lower() == "h2":
             lines.append(f"HTTP/2 streams: open={ci.h2_open_streams} total={ci.h2_total_streams}")
+            lines.append(f"HTTP/2 fp(in): {ci.h2_fp_in or '-'}")
+            lines.append(f"HTTP/2 fp(out): {ci.h2_fp_out or '-'}")
+            lines.append(f"HTTP/2 fp: {ci.h2_fp or '-'}")
         else:
             lines.append("HTTP/2 streams: n/a (not h2)")
         if ci.last_error:

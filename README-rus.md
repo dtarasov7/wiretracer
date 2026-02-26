@@ -1,4 +1,4 @@
-﻿# wiretracer
+# wiretracer
 
 TLS-терминирующий диагностический L7-прокси для HTTP/1.1, HTTP/2 и gRPC.
 
@@ -14,6 +14,8 @@ TLS-терминирующий диагностический L7-прокси д
 - Наблюдение трафика: `http1`, `http2`, `grpc`.
 - Диагностика TLS/mTLS на входе и на выходе.
 - HTTP/2 control-события (`SETTINGS`, `RST_STREAM`, `GOAWAY`, flow-control) при `logging.h2_control_events: true`.
+- HTTP/2 fingerprint (`h2fp`) по ранним H2-признакам (`SETTINGS` + `WINDOW_UPDATE`).
+- Inbound TLS ClientHello fingerprint: `JA3`, `JA4`, `ECH`, legacy `ESNI` (best-effort).
 - Режимы запуска:
   - TUI (интерактивный интерфейс);
   - headless (JSONL).
@@ -66,5 +68,4 @@ python3 wiretracer.py --config config.yaml --headless
   - `test-suite/Readme-rus.md`
   - `test-suite/TEST_SUITE_GUIDE_RUS.md`
 - Расширенная историческая документация: `ug-qwen.md`
-
 

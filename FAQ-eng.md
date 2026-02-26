@@ -1,4 +1,4 @@
-﻿## FAQ
+## FAQ
 
 ### Q1: Why do `tls` and `h2ctl` lines appear in Traffic? Is that “extra noise”?
 

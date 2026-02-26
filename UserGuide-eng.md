@@ -38,6 +38,10 @@ Main goals:
   - if incoming PROXY is present, upstream connection uses the same PROXY protocol version.
 - Extended connection telemetry:
   - `proxy_version`, `proxy_src`, `proxy_dst` in `conn open/close`, Details, and JSONL.
+- HTTP/2 fingerprint telemetry:
+  - per-side and combined `h2fp` values in Connections/Details.
+- Inbound TLS fingerprint telemetry (before TLS upgrade):
+  - `JA3`, `JA4`, `ECH` presence/length, legacy `ESNI` presence.
 
 ## 3. How the Proxy Works
 1. Accepts incoming TCP/TLS connection on listener.
@@ -143,8 +147,8 @@ In TUI:
 
 ## 7. HTTP/2 and gRPC Diagnostics
 ### 7.1 Event Types
-- `proto=tls` - inbound/outbound handshake and fail reasons;
-- `proto=h2ctl` - control frames and flow-control diagnostics;
+- `proto=tls` - inbound/outbound handshake and fail reasons; inbound side includes ClientHello fingerprints (`JA3/JA4/ECH/ESNI`) when available;
+- `proto=h2ctl` - control frames, flow-control diagnostics, and `FINGERPRINT` markers for H2 profile;
 - `proto=grpc|http2|http1` - request/response events.
 
 ### 7.1.1 Visual Error Indication in TUI
@@ -177,6 +181,10 @@ So this is normal: gRPC response is fast, while `conn.duration_ms` is ~30s (clie
   - `proto=tls outcome=fail`
   - `proto=h2ctl`
   - `proto=grpc error=1`
+  - `ja3=<md5>`
+  - `ja4=t13d...`
+  - `ech=1`
+  - `h2fp=h2fp1:...`
 
 ## 10. New Scenarios (Current Version)
 - One listener can accept mixed traffic: clients with PROXY and without PROXY.

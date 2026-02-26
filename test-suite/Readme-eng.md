@@ -1,4 +1,4 @@
-﻿# wiretracer Test Kit (EN)
+# wiretracer Test Kit (EN)
 
 ## Table of Contents
 - [Overview](#overview)
